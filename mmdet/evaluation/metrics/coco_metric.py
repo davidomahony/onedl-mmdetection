@@ -9,11 +9,11 @@ from typing import Dict, List, Optional, Sequence, Union
 import numpy as np
 import torch
 from mmengine.evaluator import BaseMetric
-from mmengine.fileio import dump, get_local_path, load
+from mmengine.fileio import FileClient, dump, load
 from mmengine.logging import MMLogger
 from terminaltables import AsciiTable
 
-from mmdet.datasets.api_wrappers import COCO, COCOeval, COCOevalMP
+from mmdet.datasets.api_wrappers import COCO, COCOeval
 from mmdet.registry import METRICS
 from mmdet.structures.mask import encode_mask_results
 from ..functional import eval_recalls
@@ -50,10 +50,9 @@ class CocoMetric(BaseMetric):
         outfile_prefix (str, optional): The prefix of json files. It includes
             the file path and the prefix of filename, e.g., "a/b/prefix".
             If not specified, a temp file will be created. Defaults to None.
-        file_client_args (dict, optional): Arguments to instantiate the
-            corresponding backend in mmdet <= 3.0.0rc6. Defaults to None.
-        backend_args (dict, optional): Arguments to instantiate the
-            corresponding backend. Defaults to None.
+        file_client_args (dict): Arguments to instantiate a FileClient.
+            See :class:`mmengine.fileio.FileClient` for details.
+            Defaults to ``dict(backend='disk')``.
         collect_device (str): Device name used for collecting results from
             different ranks during distributed training. Must be 'cpu' or
             'gpu'. Defaults to 'cpu'.
@@ -63,7 +62,6 @@ class CocoMetric(BaseMetric):
             will be used instead. Defaults to None.
         sort_categories (bool): Whether sort categories in annotations. Only
             used for `Objects365V1Dataset`. Defaults to False.
-        use_mp_eval (bool): Whether to use mul-processing evaluation
     """
     default_prefix: Optional[str] = 'coco'
 
@@ -76,12 +74,11 @@ class CocoMetric(BaseMetric):
                  metric_items: Optional[Sequence[str]] = None,
                  format_only: bool = False,
                  outfile_prefix: Optional[str] = None,
-                 file_client_args: dict = None,
-                 backend_args: dict = None,
+                 file_client_args: dict = dict(backend='disk'),
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None,
                  sort_categories: bool = False,
-                 use_mp_eval: bool = False) -> None:
+                 class_agnostic: bool = False) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
         # coco evaluation metrics
         self.metrics = metric if isinstance(metric, list) else [metric]
@@ -94,8 +91,6 @@ class CocoMetric(BaseMetric):
 
         # do class wise evaluation, default False
         self.classwise = classwise
-        # whether to use multi processing evaluation, default False
-        self.use_mp_eval = use_mp_eval
 
         # proposal_nums used to compute recall or precision.
         self.proposal_nums = list(proposal_nums)
@@ -114,20 +109,20 @@ class CocoMetric(BaseMetric):
 
         self.outfile_prefix = outfile_prefix
 
-        self.backend_args = backend_args
-        if file_client_args is not None:
-            raise RuntimeError(
-                'The `file_client_args` is deprecated, '
-                'please use `backend_args` instead, please refer to'
-                'https://github.com/vbti-development/onedl-mmdetection/blob/main/configs/_base_/datasets/coco_detection.py'  # noqa: E501
-            )
+        self.file_client_args = file_client_args
+        self.file_client = FileClient(**file_client_args)
 
         # if ann_file is not specified,
         # initialize coco api with the converted dataset
         if ann_file is not None:
-            with get_local_path(
-                    ann_file, backend_args=self.backend_args) as local_path:
+            with self.file_client.get_local_path(ann_file) as local_path:
                 self._coco_api = COCO(local_path)
+                if class_agnostic:
+                    name2id = {cat['name']: cat['id'] for cat in self._coco_api.cats.values()}
+                    for ann in self._coco_api.anns.values():
+                        name = self._coco_api.cats[ann['category_id']]['name']
+                        if len(name) == 2:
+                            ann['category_id'] = name2id['11']
                 if sort_categories:
                     # 'categories' list in objects365_train.json and
                     # objects365_val.json is inconsistent, need sort
@@ -143,6 +138,7 @@ class CocoMetric(BaseMetric):
             self._coco_api = None
 
         # handle dataset lazy init
+        self.class_agnostic = class_agnostic
         self.cat_ids = None
         self.img_ids = None
 
@@ -231,7 +227,10 @@ class CocoMetric(BaseMetric):
         segm_json_results = [] if 'masks' in results[0] else None
         for idx, result in enumerate(results):
             image_id = result.get('img_id', idx)
-            labels = result['labels']
+            if self.class_agnostic:
+                labels = result['labels'] * 0
+            else:
+                labels = result['labels']
             bboxes = result['bboxes']
             scores = result['scores']
             # bbox results
@@ -414,8 +413,13 @@ class CocoMetric(BaseMetric):
 
         # handle lazy init
         if self.cat_ids is None:
-            self.cat_ids = self._coco_api.get_cat_ids(
-                cat_names=self.dataset_meta['classes'])
+            name2id = {cat['name']: cat['id'] for cat in self._coco_api.cats.values()}
+            self.cat_ids = []
+            for name in self.dataset_meta['classes']:
+                assert name in name2id, (
+                    f'Class "{name}" defined in dataset missing in COCO file'
+                )
+                self.cat_ids.append(name2id[name])
         if self.img_ids is None:
             self.img_ids = self._coco_api.get_img_ids()
 
@@ -466,10 +470,7 @@ class CocoMetric(BaseMetric):
                     'The testing results of the whole dataset is empty.')
                 break
 
-            if self.use_mp_eval:
-                coco_eval = COCOevalMP(self._coco_api, coco_dt, iou_type)
-            else:
-                coco_eval = COCOeval(self._coco_api, coco_dt, iou_type)
+            coco_eval = COCOeval(self._coco_api, coco_dt, iou_type)
 
             coco_eval.params.catIds = self.cat_ids
             coco_eval.params.imgIds = self.img_ids
@@ -524,58 +525,35 @@ class CocoMetric(BaseMetric):
                     # precision: (iou, recall, cls, area range, max dets)
                     assert len(self.cat_ids) == precisions.shape[2]
 
-                    results_per_category = []
-                    for idx, cat_id in enumerate(self.cat_ids):
-                        t = []
-                        # area range index 0: all area ranges
-                        # max dets index -1: typically 100 per image
-                        nm = self._coco_api.loadCats(cat_id)[0]
-                        precision = precisions[:, :, idx, 0, -1]
-                        precision = precision[precision > -1]
-                        if precision.size:
-                            ap = np.mean(precision)
-                        else:
-                            ap = float('nan')
-                        t.append(f'{nm["name"]}')
-                        t.append(f'{round(ap, 3)}')
-                        eval_results[f'{nm["name"]}_precision'] = round(ap, 3)
-
-                        # indexes of IoU  @50 and @75
-                        for iou in [0, 5]:
-                            precision = precisions[iou, :, idx, 0, -1]
+                    for ious_range in [0, 5, range(10)]:
+                        logger.info('IoU:' + str(ious_range))
+                        results_per_category = []
+                        for idx, cat_id in enumerate(self.cat_ids):
+                            # area range index 0: all area ranges
+                            # max dets index -1: typically 100 per image
+                            nm = self._coco_api.loadCats(cat_id)[0]
+                            precision = precisions[ious_range, :, idx, 0, -1]
                             precision = precision[precision > -1]
                             if precision.size:
                                 ap = np.mean(precision)
                             else:
                                 ap = float('nan')
-                            t.append(f'{round(ap, 3)}')
+                            results_per_category.append(
+                                (f'{nm["name"]}', f'{round(ap, 3)}'))
+                            eval_results[f'{nm["name"]}_precision'] = round(ap, 3)
 
-                        # indexes of area of small, median and large
-                        for area in [1, 2, 3]:
-                            precision = precisions[:, :, idx, area, -1]
-                            precision = precision[precision > -1]
-                            if precision.size:
-                                ap = np.mean(precision)
-                            else:
-                                ap = float('nan')
-                            t.append(f'{round(ap, 3)}')
-                        results_per_category.append(tuple(t))
-
-                    num_columns = len(results_per_category[0])
-                    results_flatten = list(
-                        itertools.chain(*results_per_category))
-                    headers = [
-                        'category', 'mAP', 'mAP_50', 'mAP_75', 'mAP_s',
-                        'mAP_m', 'mAP_l'
-                    ]
-                    results_2d = itertools.zip_longest(*[
-                        results_flatten[i::num_columns]
-                        for i in range(num_columns)
-                    ])
-                    table_data = [headers]
-                    table_data += [result for result in results_2d]
-                    table = AsciiTable(table_data)
-                    logger.info('\n' + table.table)
+                        num_columns = min(6, len(results_per_category) * 2)
+                        results_flatten = list(
+                            itertools.chain(*results_per_category))
+                        headers = ['category', 'AP'] * (num_columns // 2)
+                        results_2d = itertools.zip_longest(*[
+                            results_flatten[i::num_columns]
+                            for i in range(num_columns)
+                        ])
+                        table_data = [headers]
+                        table_data += [result for result in results_2d]
+                        table = AsciiTable(table_data)
+                        logger.info('\n' + table.table)
 
                 if metric_items is None:
                     metric_items = [

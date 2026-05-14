@@ -1,0 +1,136 @@
+import warnings
+
+import torch
+import torch.nn.functional as F
+
+from mmdet.registry import MODELS
+from mmdet.utils import OptConfigType
+
+from projects.MaskDINO.maskdino.maskdino_head import (
+    bbox_xyxy_to_cxcywh,
+    MaskDINOHead,
+)
+from projects.DENTEX.maskdino.criterion import SetMultilabelCriterion
+from projects.DENTEX.maskdino.maskdino_multilabel_decoder_layers import MaskDINOMultilabelDecoder
+
+
+@MODELS.register_module()
+class MaskDINOMultilabelHead(MaskDINOHead):
+
+    def __init__(
+        self,
+        decoder: OptConfigType,
+        train_cfg: OptConfigType = None,
+        *args, **kwargs,
+    ):
+        num_attributes = decoder.pop('num_attributes')
+        enable_multilabel = decoder.pop('enable_multilabel')
+        enable_multiclass = decoder.pop('enable_multiclass')
+        num_classes = decoder.pop('num_classes')
+        hnm_samples = train_cfg.pop('hnm_samples')
+        use_fed_loss = train_cfg.pop('use_fed_loss')
+        share_mlp = decoder.pop('share_mlp')
+        decoder['num_classes'] = num_classes if isinstance(num_classes, int) else num_classes[0]
+        super().__init__(decoder=decoder, train_cfg=train_cfg, *args, **kwargs)
+
+        decoder['num_attributes'] = num_attributes
+        decoder['enable_multilabel'] = enable_multilabel
+        decoder['enable_multiclass'] = enable_multiclass
+        decoder['num_classes'] = num_classes
+        decoder['share_mlp'] = share_mlp
+        self.predictor = MaskDINOMultilabelDecoder(**decoder)
+
+        train_cfg['hnm_samples'] = hnm_samples
+        train_cfg['use_fed_loss'] = use_fed_loss
+        train_cfg['enable_multilabel'] = enable_multilabel
+        train_cfg['enable_multiclass'] = enable_multiclass
+        self.criterion = SetMultilabelCriterion(**train_cfg)
+
+        self.enable_multiclass = enable_multiclass
+
+    def loss(self, feats, batch_data_samples):
+        targets = self.prepare_targets(batch_data_samples)
+        outputs, mask_dict = self(feats, mask=None, targets=targets)  # TODO: deal with key_padding_masks ?
+        # bipartite matching-based loss
+        losses = self.criterion(outputs, targets, mask_dict)
+
+        for k in list(losses.keys()):
+            if k in self.criterion.weight_dict:
+                losses[k] *= self.criterion.weight_dict[k]
+            else:
+                # remove this loss if not specified in `weight_dict`
+                losses.pop(k)
+
+        return losses
+
+    def predict(self, feats, batch_data_samples):
+        outputs, mask_dict = self(feats)
+        mask_cls_results = outputs["pred_logits"]
+        mask_pred_results = outputs["pred_masks"]
+        mask_box_results = outputs["pred_boxes"]
+        mask_attrs_results = outputs["pred_multilabel_logits"]
+
+        keep = mask_cls_results.amax(dim=2).sigmoid() >= 1e-3
+        mask_cls_results = mask_cls_results[None, keep]
+        mask_pred_results = mask_pred_results[None, keep]
+        mask_box_results = mask_box_results[None, keep]
+        mask_attrs_results = mask_attrs_results[None, keep]
+
+        # upsample masks        
+        if self.enable_multiclass:
+            b, q, c, h, w = mask_pred_results.shape
+            mask_pred_results = mask_pred_results.reshape(b, q * c, h, w)
+        
+        batch_input_shape = batch_data_samples[0].metainfo['batch_input_shape']
+        mask_pred_results = F.interpolate(
+            mask_pred_results,
+            size=batch_input_shape[:2],
+            mode='bilinear',
+            align_corners=False)
+        
+        if self.enable_multiclass:
+            mask_pred_results = mask_pred_results.reshape(b, q, c, *batch_input_shape[:2])
+
+
+        return mask_cls_results, mask_pred_results, mask_box_results, mask_attrs_results
+
+    def prepare_targets(self, batch_data_samples, instances='gt_instances'):
+        # h_pad, w_pad = images.tensor.shape[-2:]  # TODO: Here is confusing
+        h_pad, w_pad = batch_data_samples[0].batch_input_shape  # TODO: make a check
+        new_targets = []
+        for data_sample in batch_data_samples:
+            sample_instances = getattr(data_sample, instances)
+
+            # pad gt
+            device = sample_instances.bboxes.device
+            h, w = data_sample.img_shape[:2]
+            image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=device)
+
+            if hasattr(sample_instances.masks, 'masks'):
+                gt_masks = torch.from_numpy(sample_instances.masks.masks)
+                if self.enable_multiclass:
+                    gt_masks = gt_masks.to(device)
+                else:
+                    gt_masks = gt_masks.bool().to(device)
+            else:
+                gt_masks = sample_instances.masks
+
+            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=device)
+            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            new_targets.append(
+                {
+                    "labels": sample_instances.labels,
+                    "masks": padded_masks,
+                    "boxes": bbox_xyxy_to_cxcywh(sample_instances.bboxes) / image_size_xyxy,
+                    **(
+                        {"multilabels": sample_instances.multilabels}
+                        if hasattr(sample_instances, 'multilabels') else {}
+                    ),
+                }
+            )
+
+            warnings.warn(  # TODO: align the lsj pipeline
+                'The lsj for MaskDINO and Mask2Former has not been fully aligned '
+                'with COCOPanopticNewBaselineDatasetMapper in original repo')
+
+        return new_targets
