@@ -122,6 +122,14 @@ class MaskDINOMultilabelFusionHead(MaskDINOFusionHead):
         # TODO: merge into MaskFormerFusionHead
         max_per_image = self.test_cfg.get('max_per_image', 100)
         focus_on_box = self.test_cfg.get('focus_on_box', False)
+        # Optional memory savers for CPU inference (off by default, so evaluation is unchanged).
+        # min_label_score drops (query, label) candidates below this class probability before
+        # their full-resolution masks are gathered; the final score never exceeds the class
+        # probability, so this is lossless for any score threshold >= min_label_score.
+        # one_label_per_query keeps only each query's best label instead of up to
+        # max_per_image alternative labels for the same mask.
+        min_label_score = self.test_cfg.get('min_label_score', None)
+        one_label_per_query = self.test_cfg.get('one_label_per_query', False)
 
         num_queries = mask_cls.shape[0]
         # shape (num_queries, num_class)
@@ -138,6 +146,25 @@ class MaskDINOMultilabelFusionHead(MaskDINOFusionHead):
             # shape (num_queries * num_class)
             labels = torch.arange(self.num_classes, device=mask_cls.device).unsqueeze(0).repeat(num_queries, 1).flatten(0, 1)  # TODO：why ？
             labels_per_image = labels[top_indices]
+
+            if min_label_score is not None:
+                keep = scores_per_image >= min_label_score
+                scores_per_image = scores_per_image[keep]
+                top_indices = top_indices[keep]
+                labels_per_image = labels_per_image[keep]
+
+            if one_label_per_query:
+                order = torch.argsort(scores_per_image, descending=True)
+                seen, best = set(), []
+                for j in order.tolist():
+                    query = int(top_indices[j]) // scores.shape[1]
+                    if query not in seen:
+                        seen.add(query)
+                        best.append(j)
+                best = torch.tensor(best, dtype=torch.long, device=top_indices.device)
+                scores_per_image = scores_per_image[best]
+                top_indices = top_indices[best]
+                labels_per_image = labels_per_image[best]
 
         query_indices = top_indices // scores.shape[1]  # TODO：why ？
         mask_cls = mask_cls[query_indices]
@@ -194,23 +221,34 @@ class MaskDINOMultilabelFusionHead(MaskDINOFusionHead):
         if self.enable_multiclass and self.enable_multilabel:
             results.masks = mask_pred >= 0
         elif self.enable_multiclass and not self.enable_multilabel:
-            fg_mask = torch.softmax(mask_pred, axis=1)
-
-            attrs = torch.arange(mask_pred.shape[1])[:, None, None].to(fg_mask)
+            # one instance at a time: materializing softmax/threshold tensors for all
+            # instances at once needs several (n, layers, H, W) float copies of the masks
+            attrs = torch.arange(mask_pred.shape[1])[:, None, None].to(mask_pred)
             thresholds = [0.1, 0.1, 0.0891, 0.3153, 0.4204, 0.1642, 0.1862, 0.0360, 0.0951]
-            thresholds = torch.tensor(thresholds)[:, None, None].to(fg_mask)
-            try:
-                results.masks = ((fg_mask >= thresholds) * attrs).argmax(1)
-            except Exception:
-                results.masks = ((fg_mask >= 0.1) * attrs).argmax(1)
+            thresholds = torch.tensor(thresholds)[:, None, None].to(mask_pred)
+            if thresholds.shape[0] != mask_pred.shape[1]:
+                thresholds = torch.full_like(thresholds[:1], 0.1)
+            instance_masks, instance_probs = [], []
+            for instance_pred in mask_pred:
+                fg_mask = torch.softmax(instance_pred, dim=0)
+                instance_masks.append(((fg_mask >= thresholds) * attrs).argmax(0))
+                fg_mask[fg_mask < 0.01] = 0.0
+                instance_probs.append(fg_mask.sum((-2, -1)) / (fg_mask > 0.0).sum((-2, -1)))
+            results.masks = (
+                torch.stack(instance_masks) if instance_masks else
+                torch.zeros((0, *mask_pred.shape[-2:]), dtype=torch.long, device=mask_pred.device)
+            )
+            fg_probs = (
+                torch.stack(instance_probs) if instance_probs else
+                torch.zeros((0, mask_pred.shape[1]), device=mask_pred.device)
+            )
         else:
             results.masks = mask_pred_binary.bool()
 
         if not self.enable_multiclass:
             results.multilogits = mask_attributes
         elif not self.enable_multilabel:
-            fg_mask[fg_mask < 0.01] = 0.0
-            multiprobs = fg_mask.sum((-2, -1)) / (fg_mask > 0.0).sum((-2, -1))
+            multiprobs = fg_probs
             multiprobs[torch.isnan(multiprobs)] = 0.0
 
             results.multilogits = multiprobs[:, 1:]

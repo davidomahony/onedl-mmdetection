@@ -70,7 +70,10 @@ class MaskDINOMultilabelHead(MaskDINOHead):
         mask_box_results = outputs["pred_boxes"]
         mask_attrs_results = outputs["pred_multilabel_logits"]
 
-        keep = mask_cls_results.amax(dim=2).sigmoid() >= 1e-3
+        # queries below this class probability are dropped before mask upsampling;
+        # raise min_query_score in test_cfg to save memory on CPU (default as before)
+        min_query_score = (self.test_cfg or {}).get('min_query_score', 1e-3)
+        keep = mask_cls_results.amax(dim=2).sigmoid() >= min_query_score
         mask_cls_results = mask_cls_results[None, keep]
         mask_pred_results = mask_pred_results[None, keep]
         mask_box_results = mask_box_results[None, keep]
