@@ -188,7 +188,7 @@ class MaskDINOMultilabelDecoder(MaskDINODecoder):
                     # refpoint_embed = mask2bbox(flaten_mask > 0).cuda()
                 else:
                     assert NotImplementedError
-                refpoint_embed = bbox_xyxy_to_cxcywh(refpoint_embed) / torch.as_tensor([w, h, w, h], dtype=torch.float).cuda()
+                refpoint_embed = bbox_xyxy_to_cxcywh(refpoint_embed) / torch.as_tensor([w, h, w, h], dtype=torch.float, device=outputs_mask.device)
                 refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 4)
                 refpoint_embed = inverse_sigmoid(refpoint_embed)
         elif not self.two_stage:
