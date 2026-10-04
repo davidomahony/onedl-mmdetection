@@ -933,6 +933,13 @@ class RandomCrop(BaseTransform):
                 results['gt_bboxes_labels'] = \
                     results['gt_bboxes_labels'][valid_inds]
 
+            # per-instance attributes (e.g. tooth findings in DENTEX
+            # LoadMultilabelAnnotations) must be dropped with their boxes,
+            # otherwise PackDetInputs pairs them with the wrong instances
+            if results.get('gt_bboxes_multilabels', None) is not None:
+                results['gt_bboxes_multilabels'] = \
+                    results['gt_bboxes_multilabels'][valid_inds]
+
             if results.get('gt_masks', None) is not None:
                 results['gt_masks'] = results['gt_masks'][
                     valid_inds.nonzero()[0]].crop(
