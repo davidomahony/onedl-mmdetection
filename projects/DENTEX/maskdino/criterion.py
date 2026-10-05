@@ -86,13 +86,36 @@ def loss_masks_ce(
     inputs: torch.Tensor,
     targets: torch.Tensor,
     num_masks: float,
+    partial: torch.Tensor = None,
 ):
     """Classification loss (NLL)
     targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+
+    ``partial`` marks masks whose finding layers were never annotated: their
+    foreground pixels only say "tooth", which is true for every layer above the
+    background. For those masks the foreground target is the union of all
+    non-background layers, so the loss teaches tooth vs background without
+    teaching that annotated-as-tooth pixels contain no fillings, caries, etc.
     """
     loss = F.cross_entropy(inputs, targets.long(), reduction="none")
 
+    if partial is not None and partial.any():
+        logits = inputs[partial]
+        log_norm = torch.logsumexp(logits, dim=1)
+        log_bg = logits[:, 0] - log_norm
+        log_fg = torch.logsumexp(logits[:, 1:], dim=1) - log_norm
+        is_fg = targets[partial] > 0
+        loss[partial] = -torch.where(is_fg, log_fg, log_bg)
+
     return loss.mean(1).sum() / num_masks
+
+
+def partial_findings_mask(targets, indices, device) -> torch.Tensor:
+    """Per matched target (in criterion order): True where findings were not annotated."""
+    return torch.cat([
+        torch.full((len(tgt_idx),), bool(t.get('partial_findings', False)), dtype=torch.bool, device=device)
+        for t, (_, tgt_idx) in zip(targets, indices)
+    ])
 
 
 class SetMultilabelCriterion(SetCriterion):
@@ -235,6 +258,8 @@ class SetMultilabelCriterion(SetCriterion):
             return {'loss_bces': src_logits.flatten()[0] * 0}
 
         if no_object:
+            if any(t.get('partial_findings', False) for t in targets):
+                raise NotImplementedError('partial_findings is only supported with no_object=False')
             idx = self._get_src_permutation_idx(indices)
             target_classes_o = torch.cat([t["multilabels"][J] for t, (_, J) in zip(targets, indices)])
             target_classes = torch.full(src_logits.shape[:2], num_classes,
@@ -257,7 +282,14 @@ class SetMultilabelCriterion(SetCriterion):
             weights[..., fed_classes] = 1
         else:
             weights = None
-        
+
+        # teeth without annotated findings only supervise column 0 (tooth present)
+        if not no_object:
+            partial = partial_findings_mask(targets, indices, src_logits.device)
+            if partial.any():
+                if weights is None:
+                    weights = torch.ones_like(src_logits)
+                weights[partial, 1:] = 0
 
         loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, weights, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
 
@@ -318,8 +350,9 @@ class SetMultilabelCriterion(SetCriterion):
         ).squeeze(1)
 
         if not self.enable_multilabel and self.enable_multiclass:
+            partial = partial_findings_mask(targets, indices, point_logits.device)
             losses = {
-                "loss_mask": loss_masks_ce(point_logits, point_labels, num_masks),
+                "loss_mask": loss_masks_ce(point_logits, point_labels, num_masks, partial),
             }
         else:
             losses = {

@@ -129,6 +129,9 @@ class MaskDINOMultilabelHead(MaskDINOHead):
                         {"multilabels": sample_instances.multilabels}
                         if hasattr(sample_instances, 'multilabels') else {}
                     ),
+                    # images whose teeth are outlined and numbered but whose findings were
+                    # never annotated (e.g. DENTEX); the criterion then supervises teeth only
+                    "partial_findings": bool(data_sample.metainfo.get('partial_findings', False)),
                 }
             )
 
