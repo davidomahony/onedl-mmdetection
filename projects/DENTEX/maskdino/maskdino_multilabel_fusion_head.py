@@ -134,11 +134,14 @@ class MaskDINOMultilabelFusionHead(MaskDINOFusionHead):
         num_queries = mask_cls.shape[0]
         # shape (num_queries, num_class)
         scores = mask_cls.sigmoid()  # TODO: modify MaskFormerFusionHead to add an arg use_sigmoid  # TODO: difference
-        scores_per_image, top_indices = scores.flatten(0, 1).topk(max_per_image, sorted=False)  # TODO：why ？
-        
+        # min_query_score can leave fewer (query, label) candidates than max_per_image
+        scores_per_image, top_indices = scores.flatten(0, 1).topk(
+            min(max_per_image, scores.numel()), sorted=False)  # TODO：why ？
+
         if self.enable_multilabel:
             scores = mask_attributes.sigmoid()
-            scores_per_image, top_indices = scores.flatten(0, 1).topk(max_per_image, sorted=False)  # TODO：why ？
+            scores_per_image, top_indices = scores.flatten(0, 1).topk(
+                min(max_per_image, scores.numel()), sorted=False)  # TODO：why ？
 
             attributes = torch.arange(scores.shape[1], device=mask_cls.device).unsqueeze(0).repeat(num_queries, 1).flatten(0, 1)  # TODO：why ？
             attributes_per_image = attributes[top_indices]
