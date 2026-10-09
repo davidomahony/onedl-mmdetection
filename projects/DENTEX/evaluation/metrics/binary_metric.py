@@ -68,9 +68,9 @@ def draw_roc_curve(
     ax.grid()
 
     fig.canvas.draw()
-    image_flat = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')  # (H * W * 3,)
-    # NOTE: reversed converts (W, H) from get_width_height to (H, W)
-    image = image_flat.reshape(*reversed(fig.canvas.get_width_height()), 3)  # (H, W, 3)
+    # FigureCanvas.tostring_rgb was removed in matplotlib 3.10; buffer_rgba works in all
+    # current versions and is already (H, W, 4)
+    image = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()  # (H, W, 3)
 
     vis = Visualizer.get_current_instance()
     vis.add_image(f'{prefix}/roc_curve', image, step=steps)
@@ -101,9 +101,9 @@ def draw_confusion_matrix(
     ConfusionMatrixDisplay.from_predictions(gt_labels, pred_labels, ax=ax)
 
     fig.canvas.draw()
-    image_flat = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')  # (H * W * 3,)
-    # NOTE: reversed converts (W, H) from get_width_height to (H, W)
-    image = image_flat.reshape(*reversed(fig.canvas.get_width_height()), 3)  # (H, W, 3)
+    # FigureCanvas.tostring_rgb was removed in matplotlib 3.10; buffer_rgba works in all
+    # current versions and is already (H, W, 4)
+    image = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()  # (H, W, 3)
 
     vis = Visualizer.get_current_instance()
     vis.add_image(f'{prefix}/confusion_matrix', image, step=steps)
